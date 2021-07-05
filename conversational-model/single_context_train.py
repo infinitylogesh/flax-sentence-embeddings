@@ -34,9 +34,7 @@ class TrainingArgs:
     weight_decay: float = 1e-3
 
     current_context_maxlen: int = 128
-    past_context_maxlen: int = 128
     response_maxlen:int = 128
-    max_past_contexts:int = 10
 
     logging_steps: int = 20
     save_dir: str = "checkpoints"
@@ -93,11 +91,11 @@ def multiple_negative_ranking_loss(embedding1, embedding2):
 
 
 @partial(jax.pmap, axis_name="batch")
-def train_step(state, current_context_input, response_input, past_context_input, drp_rng):
+def train_step(state, current_context_input, response_input, drp_rng):
     train = True
     new_drp_rng, drp_rng = jax.random.split(drp_rng, 2)
 
-    def loss_fn(params, current_context_input, response_input, past_context_input, drp_rng):
+    def loss_fn(params, current_context_input, response_input, drp_rng):
         def _forward(model_input):
             attention_mask = model_input["attention_mask"][..., None]
             embedding = state.apply_fn(**model_input, params=params, train=train, dropout_rng=drp_rng)[0]
@@ -115,27 +113,23 @@ def train_step(state, current_context_input, response_input, past_context_input,
 
             return embedding
 
-        current_context_emb, response_emb,past_context_emb = _forward(current_context_input), _forward(response_input),_forward(past_context_input)
-        full_context_emb = (current_context_emb + past_context_emb)/2
-        current_context_response_loss = state.loss_fn(current_context_emb, response_emb)
-        past_context_response_loss = state.loss_fn(past_context_emb,response_emb)
-        full_context_response_loss = state.loss_fn(full_context_emb,response_emb)
+        current_context_emb, response_emb = _forward(current_context_input), _forward(response_input)
+        loss = state.loss_fn(current_context_emb, response_emb)
         # loss considering 
         # 1) the interaction between the immediate context and its accompanying response, 
         # 2) the interaction of the response with up to N past contexts from the conversation history,
         # as well as 3) the interaction of the full context with the response
-        loss = (current_context_response_loss + past_context_response_loss + full_context_response_loss) / 3
         return jnp.mean(loss)
 
     grad_fn = jax.value_and_grad(loss_fn)
-    loss, grads = grad_fn(state.params, current_context_input, response_input, past_context_input, drp_rng)
+    loss, grads = grad_fn(state.params, current_context_input, response_input, drp_rng)
     state = state.apply_gradients(grads=grads)
 
     metrics = {"tr_loss": loss, "lr": state.scheduler_fn(state.step)}
 
     return state, metrics, new_drp_rng
 @partial(jax.pmap, axis_name="batch")
-def val_step(state, current_context_input, response_input, past_context_input):
+def val_step(state, current_context_input, response_input):
     train = False
 
     def _forward(model_input):
@@ -155,16 +149,13 @@ def val_step(state, current_context_input, response_input, past_context_input):
 
         return embedding
 
-    current_context_emb, response_emb,past_context_emb = _forward(current_context_input), _forward(response_input),_forward(past_context_input)
-    full_context_emb = (current_context_emb + past_context_emb)/2
-    current_context_response_loss = state.loss_fn(current_context_emb, response_emb)
-    past_context_response_loss = state.loss_fn(past_context_emb,response_emb)
-    full_context_response_loss = state.loss_fn(full_context_emb,response_emb)
+    current_context_emb, response_emb = _forward(current_context_input), _forward(response_input)
+    loss = state.loss_fn(current_context_emb, response_emb)
     # loss considering 
     # 1) the interaction between the immediate context and its accompanying response, 
     # 2) the interaction of the response with up to N past contexts from the conversation history,
     # as well as 3) the interaction of the full context with the response
-    loss = (current_context_response_loss + past_context_response_loss + full_context_response_loss) / 3
+   
     return jnp.mean(loss)
 
 
@@ -182,30 +173,15 @@ class DataCollator:
     tokenizer: Union[PreTrainedTokenizerFast, PreTrainedTokenizer]
     current_context_maxlen: int = 128
     response_maxlen: int = 128
-    past_context_maxlen: int = 128
-    max_past_contexts:int = 10
-
-    def _prepare_past_context(self,batch):
-      """
-      concatenation of past contexts - contexts are sorted to have the most recent context first and so on
-      """
-      past_contexts = []
-      keys = list(batch.keys())
-      keys.sort()
-      past_context_tuples = zip(*[batch[key] for key in keys if key.startswith("context/")])
-      for past_context_tuple in past_context_tuples:
-        past_context_tuple = tuple(p_ctxt for p_ctxt in past_context_tuple if p_ctxt is not None)
-        past_contexts.append(" ".join(past_context_tuple[:self.max_past_contexts]))
-      return past_contexts
 
     def __call__(self, batch):
-        # Currently only static padding; TODO: change below for adding dynamic padding support
-        past_contexts = self._prepare_past_context(batch)
         current_context_input = self.tokenizer(batch["context"], return_tensors="jax", max_length=self.current_context_maxlen, truncation=True, padding="max_length")
         response_input = self.tokenizer(batch["response"], return_tensors="jax", max_length=self.response_maxlen, truncation=True, padding="max_length")
-        past_context_input = self.tokenizer(past_contexts, return_tensors="jax",max_length=self.past_context_maxlen, truncation=True, padding="max_length")
-        current_context_input, response_input,past_context_input = dict(current_context_input), dict(response_input),dict(past_context_input)
-        return shard(current_context_input), shard(response_input), shard(past_context_input)
+        current_context_input, response_input = dict(current_context_input), dict(response_input)
+        return shard(current_context_input), shard(response_input)
+    
+    
+
 
 def save_checkpoint(save_dir, state, save_fn=None, training_args=None):
     print(f"saving checkpoint in {save_dir}", end=" ... ")
@@ -265,9 +241,7 @@ def main(args,logger):
     data_collator = DataCollator(
         tokenizer=tokenizer,
         current_context_maxlen=args.current_context_maxlen,
-        response_maxlen=args.response_maxlen,
-        past_context_maxlen=args.past_context_maxlen,
-        max_past_contexts = args.max_past_contexts
+        response_maxlen=args.response_maxlen
     )
 
     tr_dataset, val_dataset = prepare_dataset(args)
@@ -298,8 +272,8 @@ def main(args,logger):
         total = len(tr_dataset) // args.batch_size
         batch_iterator = get_batched_dataset(tr_dataset, args.batch_size, seed=epoch)
         for i,batch in tqdm(enumerate(batch_iterator), desc=f"Running epoch-{epoch}",total=total):
-            current_context_input, response_input,past_context_input = data_collator(batch)
-            state, metrics, drp_rng = train_step(state,current_context_input, response_input,past_context_input, drp_rng)
+            current_context_input, response_input = data_collator(batch)
+            state, metrics, drp_rng = train_step(state,current_context_input, response_input, drp_rng)
             print(metrics)
             if (i + 1) % args.logging_steps == 0:
                 tr_loss = jax_utils.unreplicate(metrics["tr_loss"]).item()
@@ -313,8 +287,8 @@ def main(args,logger):
         total = len(val_dataset) // args.batch_size
         val_batch_iterator = get_batched_dataset(val_dataset, args.batch_size, seed=None)
         for j, batch in tqdm(enumerate(val_batch_iterator), desc=f"evaluating after epoch-{epoch}", total=total):
-            current_context_input, response_input,past_context_input = data_collator(batch)
-            val_step_loss = val_step(state, current_context_input, response_input,past_context_input)
+            current_context_input, response_input = data_collator(batch)
+            val_step_loss = val_step(state, current_context_input, response_input)
             val_loss += jax_utils.unreplicate(val_step_loss)
 
         val_loss = val_loss.item() / (j + 1)
