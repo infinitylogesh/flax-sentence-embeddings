@@ -2,6 +2,14 @@ from os import name
 import numpy as np
 from tqdm import tqdm
 
+def similarity(contexts,responses,is_normalize=True):
+  if is_normalize:
+    responses /= np.linalg.norm(
+              responses, axis=1, keepdims=True)
+    contexts /= np.linalg.norm(
+                contexts, axis=1, keepdims=True)
+  return np.dot(contexts,responses.T)
+
 def recall_k(n,sim_func,contexts, responses):
     """
     Recall 1-of-N metric as used in conveRT paper. 

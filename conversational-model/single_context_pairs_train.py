@@ -17,8 +17,10 @@ from transformers import AutoTokenizer, FlaxBertModel
 import wandb
 import json
 import os
+import numpy as onp
 
 from datasets import load_dataset, DatasetDict
+from evaluation.metrics import recall_k,similarity
 from transformers import AutoTokenizer, FlaxAutoModel
 
 
@@ -156,7 +158,7 @@ def val_step(state, current_context_input, response_input):
     # 2) the interaction of the response with up to N past contexts from the conversation history,
     # as well as 3) the interaction of the full context with the response
    
-    return jnp.mean(loss)
+    return jnp.mean(loss),current_context_emb,response_emb
 
 
 
@@ -289,16 +291,26 @@ def main(args,logger):
                 }, commit=True)
 
         val_loss = jnp.array(0.)
+        val_recall = jnp.array(0.)
         total = len(val_dataset) // args.batch_size
         val_batch_iterator = get_batched_dataset(val_dataset, args.batch_size, seed=None)
         for j, batch in tqdm(enumerate(val_batch_iterator), desc=f"evaluating after epoch-{epoch}", total=total):
             current_context_input, response_input = data_collator(batch)
             val_step_loss = val_step(state, current_context_input, response_input)
+            val_step_loss,val_current_context_emb,val_response_emb = val_step(state, current_context_input, response_input)
+            val_current_context_emb = jax_utils.unreplicate(val_current_context_emb)
+            val_response_emb = jax_utils.unreplicate(val_response_emb)
+            val_current_context_emb = onp.array(val_current_context_emb)
+            val_response_emb = onp.array(val_response_emb)
+            val_recall += recall_k(100,similarity,val_current_context_emb,val_response_emb)
             val_loss += jax_utils.unreplicate(val_step_loss)
+            del val_response_emb
+            del val_current_context_emb
 
         val_loss = val_loss.item() / (j + 1)
-        print(f"val_loss: {val_loss}")
-        logger.log({"val_loss": val_loss}, commit=True)
+        val_recall = val_recall.item() / (j+1)
+        print(f"val_loss: {val_loss}, val_recall:{val_recall}")
+        logger.log({"val_loss": val_loss,"val_recall":val_recall}, commit=True)
 
         save_dir = args.save_dir + f"-epoch-{epoch}"
         save_checkpoint(save_dir, state, save_fn=model.save_pretrained, training_args=args)
