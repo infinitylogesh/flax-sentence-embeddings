@@ -3,8 +3,8 @@ from functools import partial
 from typing import Callable, List, Union
 
 import jax
-from jax.config import config
-config.update('jax_enable_x64', True)
+#from jax.config import config
+#config.update('jax_enable_x64', True)
 import jax.numpy as jnp
 import optax
 from flax import jax_utils, struct, traverse_util
@@ -16,19 +16,20 @@ from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 from transformers import AutoTokenizer, FlaxBertModel
 import wandb
 import json
-import os
+import os,sys
 import numpy as onp
-
+sys.path.append("./")
 from datasets import load_dataset, DatasetDict
 from evaluation.metrics import recall_k,similarity
+from trainer.loss.custom import multiple_negatives_ranking_loss
 from transformers import AutoTokenizer, FlaxAutoModel
 
 
 @dataclass
 class TrainingArgs:
-    model_id: str = "DeepPavlov/bert-base-cased-conversational"
+    model_id: str = "microsoft/MiniLM-L12-H384-uncased"
     max_epochs: int = 5
-    batch_size_per_device: int = 256
+    batch_size_per_device: int = 512
     seed: int = 42
     lr: float = 2e-5
     init_lr: float = 1e-5
@@ -38,18 +39,18 @@ class TrainingArgs:
     current_context_maxlen: int = 128
     response_maxlen:int = 128
 
-    logging_steps: int = 20
-    save_dir: str = "checkpoints"
+    logging_steps: int = 2000
+    save_dir: str = "reddit_20M_msftl_minilm"
 
     tr_data_files: List[str] = field(
         default_factory=lambda: [
-            "data/dummy.jsonl",
+            "data/redditaa",
         ]
     )
 
     val_data_files: List[str] = field(
         default_factory=lambda: [
-            "data/dummy.jsonl",
+            "data/redditab",
         ]
     )
 
@@ -80,16 +81,16 @@ class TrainState(train_state.TrainState):
     scheduler_fn: Callable = struct.field(pytree_node=False)
 
 
-def multiple_negative_ranking_loss(embedding1, embedding2):
-    def _cross_entropy(logits):
-        bsz = logits.shape[-1]
-        labels = (jnp.arange(bsz)[..., None] == jnp.arange(bsz)[None]).astype("f4")
-        logits = jax.nn.log_softmax(logits, axis=-1)
-        loss = -jnp.sum(labels * logits, axis=-1)
-        return loss
-
-    batch_similarity = jnp.dot(embedding1, jnp.transpose(embedding2))
-    return _cross_entropy(batch_similarity)
+#def multiple_negative_ranking_loss(embedding1, embedding2):
+#    def _cross_entropy(logits):
+#        bsz = logits.shape[-1]
+#        labels = (jnp.arange(bsz)[..., None] == jnp.arange(bsz)[None]).astype("f4")
+#        logits = jax.nn.log_softmax(logits, axis=-1)
+#        loss = -jnp.sum(labels * logits, axis=-1)
+#        return loss
+#
+#    batch_similarity = jnp.dot(embedding1, jnp.transpose(embedding2))
+#    return _cross_entropy(batch_similarity)
 
 
 @partial(jax.pmap, axis_name="batch")
@@ -231,7 +232,7 @@ def prepare_dataset(args):
         num_samples = len(dataset[split]) - len(dataset[split]) % args.batch_size
         dataset[split] = dataset[split].shuffle(seed=args.seed).select(range(num_samples))
     
-    tr_dataset, val_dataset = dataset["train"], dataset["validation"]
+    tr_dataset, val_dataset = dataset["train"].select(range(500000)), dataset["validation"].select(range(10000))
     return tr_dataset, val_dataset
 
 
@@ -266,7 +267,7 @@ def main(args,logger):
         apply_fn=model.__call__,
         params=model.params,
         tx=tx,
-        loss_fn=multiple_negative_ranking_loss,
+        loss_fn=multiple_negatives_ranking_loss,#multiple_negative_ranking_loss,
         scheduler_fn=lr,
     )
     state = jax_utils.replicate(state)
@@ -281,7 +282,7 @@ def main(args,logger):
         for i,batch in tqdm(enumerate(batch_iterator), desc=f"Running epoch-{epoch}",total=total):
             current_context_input, response_input = data_collator(batch)
             state, metrics, drp_rng = train_step(state,current_context_input, response_input, drp_rng)
-            print(metrics)
+            #print(metrics)
             if (i + 1) % args.logging_steps == 0:
                 tr_loss = jax_utils.unreplicate(metrics["tr_loss"]).item()
                 tqdm.write(str(dict(tr_loss=tr_loss, step=i+1)))
