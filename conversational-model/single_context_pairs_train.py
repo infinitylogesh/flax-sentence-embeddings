@@ -22,6 +22,7 @@ sys.path.append("./")
 from datasets import load_dataset, DatasetDict
 from evaluation.metrics import recall_k,similarity
 from trainer.loss.custom import multiple_negatives_ranking_loss
+from trainer.utls.ops import normalize_L2,mean_pooling
 from transformers import AutoTokenizer, FlaxAutoModel
 
 
@@ -32,9 +33,9 @@ class TrainingArgs:
     batch_size_per_device: int = 512
     seed: int = 42
     lr: float = 2e-5
-    init_lr: float = 1e-5
-    warmup_steps: int = 2000
-    weight_decay: float = 1e-3
+    init_lr: float = 0
+    warmup_steps: int = 500
+    weight_decay: float = 1e-2
 
     current_context_maxlen: int = 128
     response_maxlen:int = 128
@@ -65,13 +66,19 @@ def scheduler_fn(lr, init_lr, warmup_steps, num_train_steps):
     lr = optax.join_schedules(schedules=[warmup_fn, decay_fn], boundaries=[warmup_steps])
     return lr
 
+def warmup_and_constant(lr, init_lr, warmup_steps):
+    warmup_fn = optax.linear_schedule(init_value=init_lr, end_value=lr, transition_steps=warmup_steps)
+    constant_fn = optax.constant_schedule(value=lr)
+    lr = optax.join_schedules(schedules=[warmup_fn, constant_fn], boundaries=[warmup_steps])
+    return lr
+
 
 def build_tx(lr, init_lr, warmup_steps, num_train_steps, weight_decay):
     def weight_decay_mask(params):
         params = traverse_util.flatten_dict(params)
         mask = {k: (v[-1] != "bias" and v[-2:] != ("LayerNorm", "scale")) for k, v in params.items()}
         return traverse_util.unflatten_dict(mask)
-    lr = scheduler_fn(lr, init_lr, warmup_steps, num_train_steps)
+    lr = warmup_and_constant(lr, init_lr, warmup_steps)
     tx = optax.adamw(learning_rate=lr, weight_decay=weight_decay, mask=weight_decay_mask)
     return tx, lr
 
@@ -100,15 +107,11 @@ def train_step(state, current_context_input, response_input, drp_rng):
 
     def loss_fn(params, current_context_input, response_input, drp_rng):
         def _forward(model_input):
-            attention_mask = model_input["attention_mask"][..., None]
-            embedding = state.apply_fn(**model_input, params=params, train=train, dropout_rng=drp_rng)[0]
-            attention_mask = jnp.broadcast_to(attention_mask, jnp.shape(embedding))
-
-            embedding = embedding * attention_mask
-            embedding = jnp.mean(embedding, axis=1)
-
-            modulus = jnp.sum(jnp.square(embedding), axis=-1, keepdims=True)
-            embedding = embedding / jnp.maximum(modulus, 1e-12)
+            attention_mask = model_input["attention_mask"]
+            model_output = state.apply_fn(**model_input, params=params, train=train, dropout_rng=drp_rng)
+            
+            embedding = mean_pooling(model_output, attention_mask)
+            embedding = normalize_L2(embedding)
 
             # gather all the embeddings on same device for calculation loss over global batch
             embedding = jax.lax.all_gather(embedding, axis_name="batch")
@@ -136,15 +139,11 @@ def val_step(state, current_context_input, response_input):
     train = False
 
     def _forward(model_input):
-        attention_mask = model_input["attention_mask"][..., None]
-        embedding = state.apply_fn(**model_input, params=state.params, train=train)[0]
-        attention_mask = jnp.broadcast_to(attention_mask, jnp.shape(embedding))
+        attention_mask = model_input["attention_mask"]
+        model_output = state.apply_fn(**model_input, params=state.params, train=train)        
 
-        embedding = embedding * attention_mask
-        embedding = jnp.mean(embedding, axis=1)
-
-        modulus = jnp.sum(jnp.square(embedding), axis=-1, keepdims=True)
-        embedding = embedding / jnp.maximum(modulus, 1e-12)
+        embedding = mean_pooling(model_output, attention_mask)
+        embedding = normalize_L2(embedding)
 
         # gather all the embeddings on same device for calculation loss over global batch
         embedding = jax.lax.all_gather(embedding, axis_name="batch")
